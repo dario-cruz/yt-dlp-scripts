@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Binaries
+yt-dlp.exe
+ffmpeg.exe
+ffprobe.exe
+
+# Media files
+*.mp3
+*.m4a
+*.webm
+*.opus
+*.wav
+*.part
+*.ytdl
+*.jpg
+*.jpeg
+*.png
+*.webp
+
+# OS generated files
+Thumbs.db
+.DS_Store
