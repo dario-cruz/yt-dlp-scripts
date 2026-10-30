@@ -20,8 +20,22 @@ Set-Location -Path $ScriptDir
 
 Write-Host "Downloading playlist: $PlaylistUrl" -ForegroundColor Cyan
 
+# Locate yt-dlp executable (local folder, PATH, or fallback)
+$ytDlpCmd = $null
+if (Test-Path -LiteralPath "$ScriptDir\yt-dlp.exe") {
+    $ytDlpCmd = "$ScriptDir\yt-dlp.exe"
+} elseif (Get-Command yt-dlp -ErrorAction SilentlyContinue) {
+    $ytDlpCmd = "yt-dlp"
+} elseif (Test-Path -LiteralPath "C:\yt-dlp\yt-dlp.exe") {
+    $ytDlpCmd = "C:\yt-dlp\yt-dlp.exe"
+} else {
+    Write-Host "Error: yt-dlp was not found in '$ScriptDir' or in your system PATH." -ForegroundColor Red
+    Write-Host "Please place yt-dlp.exe in this folder or install it to your system PATH." -ForegroundColor Yellow
+    exit 1
+}
+
 # Run yt-dlp
-.\yt-dlp.exe -x --audio-format mp3 --audio-quality 0 --embed-metadata --embed-thumbnail --yes-playlist -o "%(title)s - %(uploader)s.%(ext)s" $PlaylistUrl
+& $ytDlpCmd -x --audio-format mp3 --audio-quality 0 --embed-metadata --embed-thumbnail --yes-playlist -o "%(title)s - %(uploader)s.%(ext)s" $PlaylistUrl
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "yt-dlp encountered an error. Exiting." -ForegroundColor Red
@@ -29,6 +43,12 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "Download complete. Processing files with Node scripts..." -ForegroundColor Cyan
+
+# Ensure node dependencies are installed
+if (-not (Test-Path -LiteralPath "$ScriptDir\node_modules")) {
+    Write-Host "Node modules not found. Installing dependencies via npm..." -ForegroundColor Yellow
+    npm --prefix "$ScriptDir" install
+}
 
 Write-Host "Running update_genres.js..." -ForegroundColor Yellow
 node .\update_genres.js
