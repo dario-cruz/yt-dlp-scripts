@@ -90,7 +90,7 @@ node .\remove_topic.js
 Write-Host "All processing complete!" -ForegroundColor Green
 
 # -------------------------------------------------------------
-# Move tracks to destination folder (for Rekordbox Auto Import)
+# Move tracks to destination folder (e.g. DJ tracks library)
 # -------------------------------------------------------------
 $shouldMove = $false
 
