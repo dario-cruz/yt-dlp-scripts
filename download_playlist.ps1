@@ -7,7 +7,7 @@ param (
 )
 
 if ([string]::IsNullOrWhiteSpace($PlaylistUrl)) {
-    $PlaylistUrl = Read-Host "Please enter the YouTube playlist URL"
+    $PlaylistUrl = Read-Host "Please enter the YouTube track or playlist URL"
 }
 
 if ([string]::IsNullOrWhiteSpace($PlaylistUrl)) {
@@ -18,8 +18,70 @@ if ([string]::IsNullOrWhiteSpace($PlaylistUrl)) {
 # Set the working directory to the script's directory so it finds the exe and js files
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 Set-Location -Path $ScriptDir
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-Write-Host "Downloading playlist: $PlaylistUrl" -ForegroundColor Cyan
+# -------------------------------------------------------------
+# Select destination folder upfront for pre-check & final move
+# -------------------------------------------------------------
+$shouldMove = $false
+
+if ($NoMove) {
+    $shouldMove = $false
+} elseif ($AutoMove) {
+    $shouldMove = $true
+} else {
+    while ($true) {
+        Write-Host "`nSelect Destination Directory:" -ForegroundColor Cyan
+        Write-Host "Current Destination: '$DestinationDir'" -ForegroundColor Gray
+        Write-Host "  [Y] Use default destination folder (Default)" -ForegroundColor White
+        Write-Host "  [C] Choose another destination folder" -ForegroundColor White
+        Write-Host "  [N] Don't move (keep tracks in working folder)" -ForegroundColor White
+        $choice = Read-Host "Choose an option [Y/c/n] (Default: Y)"
+        $choice = $choice.Trim().ToLower()
+
+        if ([string]::IsNullOrWhiteSpace($choice) -or $choice -in 'y', 'yes') {
+            $shouldMove = $true
+            break
+        } elseif ($choice -in 'c', 'change') {
+            $newDest = Read-Host "Enter destination folder path"
+            if (-not [string]::IsNullOrWhiteSpace($newDest)) {
+                $DestinationDir = $newDest.Trim('"', "'").Trim()
+                Write-Host "Destination updated to: '$DestinationDir'" -ForegroundColor Green
+                $shouldMove = $true
+                break
+            } else {
+                Write-Host "No path entered. Keeping '$DestinationDir'." -ForegroundColor Yellow
+            }
+        } elseif ($choice -in 'n', 'no') {
+            $shouldMove = $false
+            break
+        } else {
+            Write-Host "Invalid option. Please choose Y, C, or N." -ForegroundColor Yellow
+        }
+    }
+}
+
+if ($shouldMove) {
+    # Check if destination directory exists or needs creation
+    if (-not (Test-Path -LiteralPath $DestinationDir)) {
+        $driveQualifier = Split-Path -Path $DestinationDir -Qualifier
+        if (-not [string]::IsNullOrWhiteSpace($driveQualifier) -and -not (Test-Path -LiteralPath "$driveQualifier\")) {
+            Write-Host "Drive '$driveQualifier\' is not accessible. Please ensure your Google Drive or external drive is connected." -ForegroundColor Red
+            Write-Host "Tracks will remain in '$ScriptDir'." -ForegroundColor Yellow
+            $shouldMove = $false
+        } else {
+            try {
+                New-Item -ItemType Directory -Path $DestinationDir -Force | Out-Null
+                Write-Host "Created destination folder: $DestinationDir" -ForegroundColor Green
+            } catch {
+                Write-Host "Could not create destination directory '$DestinationDir': $_" -ForegroundColor Red
+                $shouldMove = $false
+            }
+        }
+    }
+}
+
+$TargetCheckDir = if ($shouldMove) { $DestinationDir } else { $ScriptDir }
 
 # Locate or automatically download yt-dlp executable
 $ytDlpCmd = $null
@@ -62,8 +124,102 @@ if (-not $SkipUpdate) {
     }
 }
 
+# -------------------------------------------------------------
+# Pre-check: Scan target directory and compare intended tracks
+# -------------------------------------------------------------
+Write-Host "`nScanning '$TargetCheckDir' for existing MP3 files..." -ForegroundColor Cyan
+$existingMp3Set = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+if (Test-Path -LiteralPath $TargetCheckDir) {
+    $existingFiles = Get-ChildItem -LiteralPath $TargetCheckDir -Filter "*.mp3" -File -ErrorAction SilentlyContinue
+    foreach ($f in $existingFiles) {
+        [void]$existingMp3Set.Add($f.Name)
+    }
+}
+
+Write-Host "Fetching intended track list from: $PlaylistUrl" -ForegroundColor Cyan
+$rawTrackLines = & $ytDlpCmd --encoding utf-8 --flat-playlist --yes-playlist -o "%(title)s - %(uploader)s.mp3" --print "%(playlist_index)s`t%(id)s`t%(filename)s" $PlaylistUrl
+
+if ($LASTEXITCODE -ne 0 -or -not $rawTrackLines) {
+    Write-Host "Failed to retrieve track information from URL. Exiting." -ForegroundColor Red
+    exit 1
+}
+
+$intendedTracks = @()
+$lineCounter = 0
+foreach ($line in @($rawTrackLines)) {
+    if ([string]::IsNullOrWhiteSpace($line)) { continue }
+    $parts = $line -split "`t", 3
+    if ($parts.Count -lt 3) { continue }
+    $lineCounter++
+    $pIndex = if (-not [string]::IsNullOrWhiteSpace($parts[0]) -and $parts[0] -ne 'NA') { $parts[0].Trim() } else { "$lineCounter" }
+    $videoId = $parts[1].Trim()
+    $rawFileName = $parts[2].Trim()
+    $cleanFileName = $rawFileName -replace '(?i) - topic', ''
+    $isDuplicate = $existingMp3Set.Contains($cleanFileName) -or $existingMp3Set.Contains($rawFileName)
+
+    $intendedTracks += [PSCustomObject]@{
+        Index         = $pIndex
+        Id            = $videoId
+        RawFileName   = $rawFileName
+        CleanFileName = $cleanFileName
+        IsDuplicate   = $isDuplicate
+    }
+}
+
+$duplicateTracks = @($intendedTracks | Where-Object { $_.IsDuplicate })
+$reDownloadDuplicates = $false
+$playlistItemsArg = $null
+
+if ($duplicateTracks.Count -gt 0) {
+    Write-Host "`nThe following $($duplicateTracks.Count) track(s) are already present in '$TargetCheckDir':" -ForegroundColor Yellow
+    foreach ($dup in $duplicateTracks) {
+        Write-Host "  - $($dup.CleanFileName)" -ForegroundColor DarkYellow
+    }
+
+    while ($true) {
+        $dupChoice = Read-Host "`nWould you like to re-download these track(s)? [Y/N] (Default: N)"
+        $dupChoice = $dupChoice.Trim().ToLower()
+        if ([string]::IsNullOrWhiteSpace($dupChoice) -or $dupChoice -in 'n', 'no') {
+            $reDownloadDuplicates = $false
+            break
+        } elseif ($dupChoice -in 'y', 'yes') {
+            $reDownloadDuplicates = $true
+            break
+        } else {
+            Write-Host "Invalid option. Please enter Y or N." -ForegroundColor Yellow
+        }
+    }
+
+    if (-not $reDownloadDuplicates) {
+        $tracksToDownload = @($intendedTracks | Where-Object { -not $_.IsDuplicate })
+        if ($tracksToDownload.Count -eq 0) {
+            Write-Host "`nAll $($intendedTracks.Count) track(s) are already present in '$TargetCheckDir'. Nothing to download. Exiting." -ForegroundColor Green
+            exit 0
+        }
+        $playlistItemsArg = ($tracksToDownload | ForEach-Object { $_.Index }) -join ","
+        Write-Host "`nSkipping $($duplicateTracks.Count) existing track(s). Downloading $($tracksToDownload.Count) new track(s)..." -ForegroundColor Cyan
+    } else {
+        Write-Host "`nProceeding to re-download all $($intendedTracks.Count) track(s)..." -ForegroundColor Cyan
+    }
+} else {
+    Write-Host "No existing duplicate tracks found in '$TargetCheckDir'. Proceeding to download $($intendedTracks.Count) track(s)..." -ForegroundColor Green
+}
+
 # Run yt-dlp
-& $ytDlpCmd -x --audio-format mp3 --audio-quality 0 --embed-metadata --embed-thumbnail --yes-playlist -o "%(title)s - %(uploader)s.%(ext)s" $PlaylistUrl
+$ytDlpArgs = @(
+    "-x",
+    "--audio-format", "mp3",
+    "--audio-quality", "0",
+    "--embed-metadata",
+    "--embed-thumbnail",
+    "--yes-playlist"
+)
+if ($playlistItemsArg) {
+    $ytDlpArgs += @("--playlist-items", $playlistItemsArg)
+}
+$ytDlpArgs += @("-o", "%(title)s - %(uploader)s.%(ext)s", $PlaylistUrl)
+
+& $ytDlpCmd @ytDlpArgs
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "yt-dlp encountered an error. Exiting." -ForegroundColor Red
@@ -92,64 +248,6 @@ Write-Host "All processing complete!" -ForegroundColor Green
 # -------------------------------------------------------------
 # Move tracks to destination folder (e.g. DJ tracks library)
 # -------------------------------------------------------------
-$shouldMove = $false
-
-if ($NoMove) {
-    $shouldMove = $false
-} elseif ($AutoMove) {
-    $shouldMove = $true
-} else {
-    while ($true) {
-        Write-Host "`nTrack Processing Complete." -ForegroundColor Cyan
-        Write-Host "Current Destination: '$DestinationDir'" -ForegroundColor Gray
-        Write-Host "  [Y] Move tracks to destination folder (Default)" -ForegroundColor White
-        Write-Host "  [C] Change destination folder" -ForegroundColor White
-        Write-Host "  [N] Don't move (keep tracks in working folder)" -ForegroundColor White
-        $choice = Read-Host "Choose an option [Y/c/n] (Default: Y)"
-        $choice = $choice.Trim().ToLower()
-
-        if ([string]::IsNullOrWhiteSpace($choice) -or $choice -in 'y', 'yes') {
-            $shouldMove = $true
-            break
-        } elseif ($choice -in 'c', 'change') {
-            $newDest = Read-Host "Enter new destination folder path"
-            if (-not [string]::IsNullOrWhiteSpace($newDest)) {
-                $DestinationDir = $newDest.Trim('"', "'").Trim()
-                Write-Host "Destination updated to: '$DestinationDir'" -ForegroundColor Green
-                $shouldMove = $true
-                break
-            } else {
-                Write-Host "No path entered. Keeping '$DestinationDir'." -ForegroundColor Yellow
-            }
-        } elseif ($choice -in 'n', 'no') {
-            $shouldMove = $false
-            break
-        } else {
-            Write-Host "Invalid option. Please choose Y, C, or N." -ForegroundColor Yellow
-        }
-    }
-}
-
-if ($shouldMove) {
-    # Check if destination directory exists or needs creation
-    if (-not (Test-Path -LiteralPath $DestinationDir)) {
-        $driveQualifier = Split-Path -Path $DestinationDir -Qualifier
-        if (-not [string]::IsNullOrWhiteSpace($driveQualifier) -and -not (Test-Path -LiteralPath "$driveQualifier\")) {
-            Write-Host "Drive '$driveQualifier\' is not accessible. Please ensure your Google Drive or external drive is connected." -ForegroundColor Red
-            Write-Host "Tracks will remain in '$ScriptDir'." -ForegroundColor Yellow
-            $shouldMove = $false
-        } else {
-            try {
-                New-Item -ItemType Directory -Path $DestinationDir -Force | Out-Null
-                Write-Host "Created destination folder: $DestinationDir" -ForegroundColor Green
-            } catch {
-                Write-Host "Could not create destination directory '$DestinationDir': $_" -ForegroundColor Red
-                $shouldMove = $false
-            }
-        }
-    }
-}
-
 if ($shouldMove) {
     $mp3Files = Get-ChildItem -LiteralPath $ScriptDir -Filter "*.mp3" -File
 
@@ -160,45 +258,12 @@ if ($shouldMove) {
 
         $movedCount = 0
         $skippedCount = 0
-        $overwriteAll = $false
-        $skipAll = $false
 
         foreach ($file in $mp3Files) {
             $targetPath = Join-Path -Path $DestinationDir -ChildPath $file.Name
             $destinationExists = Test-Path -LiteralPath $targetPath
-            $shouldOverwriteFile = $true
 
-            if ($destinationExists) {
-                if ($overwriteAll) {
-                    $shouldOverwriteFile = $true
-                } elseif ($skipAll) {
-                    $shouldOverwriteFile = $false
-                } else {
-                    Write-Host "`nTrack already exists in destination:" -ForegroundColor Yellow
-                    Write-Host "  File: $($file.Name)" -ForegroundColor DarkGray
-                    $choice = Read-Host "Overwrite existing file? [Y]es / [N]o / [A]ll / [S]kip all (Default: N)"
-                    $choice = $choice.Trim().ToLower()
-
-                    switch ($choice) {
-                        { $_ -in 'y', 'yes' } {
-                            $shouldOverwriteFile = $true
-                        }
-                        { $_ -in 'a', 'all' } {
-                            $shouldOverwriteFile = $true
-                            $overwriteAll = $true
-                        }
-                        { $_ -in 's', 'skip', 'skip all' } {
-                            $shouldOverwriteFile = $false
-                            $skipAll = $true
-                        }
-                        default {
-                            $shouldOverwriteFile = $false
-                        }
-                    }
-                }
-            }
-
-            if ($destinationExists -and -not $shouldOverwriteFile) {
+            if ($destinationExists -and -not $reDownloadDuplicates) {
                 Write-Host "Skipped: '$($file.Name)' (kept existing in destination)" -ForegroundColor DarkGray
                 $skippedCount++
                 continue
